@@ -118,13 +118,19 @@ services:
   grafana:
     image: grafana/grafana:11.5.4
     container_name: grafana
+    user: root
+    entrypoint: ["/bin/sh", "/grafana-qr-entrypoint.sh"]
     volumes:
       - "./${SAMPLE_APP}/src/grafana/dashboards.yml:/etc/grafana/provisioning/dashboards/main.yml"
       - "./${SAMPLE_APP}/src/grafana/dashboards:/var/lib/grafana/dashboards"
       - "./${SAMPLE_APP}/src/grafana/datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml"
+      - "./${SAMPLE_APP}/src/grafana:/grafana-src"
+      - "./grafana-with-qr/entrypoint.sh:/grafana-qr-entrypoint.sh:ro"
+      - "../../.git:/edge-ai-suites-git:ro"
     networks:
       - app_network
     environment:
+      - GIT_BRANCH=${GIT_BRANCH}
       - GF_INSTALL_PLUGINS=grafana-mqtt-datasource 1.3.3
       - http_proxy=${http_proxy}
       - https_proxy=${https_proxy}
