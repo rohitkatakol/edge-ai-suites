@@ -19,11 +19,15 @@ On each message:
 from __future__ import annotations
 
 import asyncio
+import json
 import ssl
+import time
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any
 
 import structlog
 
+from .loitering_tracker import LoiteringTracker, extract_tracked_objects
 from .translator import translate_dls_metadata
 
 if TYPE_CHECKING:
@@ -54,12 +58,21 @@ class MqttSubscriber:
         label_type_map: dict[str, str] | None = None,
         timestamp_offset_ms: int = 0,
         tls_context: ssl.SSLContext | None = None,
+        loitering_stop_duration_seconds: float = 0.0,
+        loitering_publish_interval_seconds: float = 5.0,
+        loitering_min_confidence: float = 0.1,
+        loitering_zone_ior_threshold: float = 0.5,
     ) -> None:
         """Subscribe to MQTT and dispatch messages until cancelled.
 
         Topic wildcard: ``+/{analytics_app_id}/+`` (matches ``/{vms_name}/{analytics_app_id}/{camera_id}``)
         Leading slash is optional — both ``/nx-main/dls_vision/device`` and ``nx-main/dls_vision/device`` are
         handled by stripping the leading slash before splitting.
+
+        When ``loitering_stop_duration_seconds`` > 0, per-camera dwell time is tracked from the
+        same messages and a per-object snapshot (every tracked object, each with a ``status``
+        field) is published (rate-limited, default every 5s) to
+        ``{vms_name}/{analytics_app_id}/loiter_status/{device_id}``.
         """
         try:
             import aiomqtt  # type: ignore[import]
@@ -73,6 +86,12 @@ class MqttSubscriber:
         # Build a name → shim lookup for fast dispatch
         shim_map: dict[str, Any] = {ss.name: ss.vms_shim for ss in vms_shim_sets}
         _label_map: dict[str, str] = {k.lower(): v for k, v in (label_type_map or {}).items()}
+        tracker = (
+            LoiteringTracker(loitering_stop_duration_seconds)
+            if loitering_stop_duration_seconds > 0
+            else None
+        )
+        last_loiter_publish: dict[str, float] = {}
 
         # Wildcard: single-level + matches any vms_name; trailing + matches any camera_id
         topic_filter = f"+/{analytics_app_id}/+"
@@ -97,6 +116,13 @@ class MqttSubscriber:
                             analytics_app_id,
                             _label_map,
                             timestamp_offset_ms,
+                            client,
+                            tracker,
+                            loitering_publish_interval_seconds,
+                            last_loiter_publish,
+                            loitering_min_confidence,
+                            loitering_zone_ior_threshold,
+                            loitering_stop_duration_seconds,
                         )
             except asyncio.CancelledError:
                 logger.info("mqtt_subscriber_stopped")
@@ -117,10 +143,15 @@ class MqttSubscriber:
         analytics_app_id: str,
         label_type_map: dict[str, str] | None = None,
         timestamp_offset_ms: int = 0,
+        mqtt_client: Any = None,
+        tracker: LoiteringTracker | None = None,
+        loitering_publish_interval_s: float = 1.0,
+        last_loiter_publish: dict[str, float] | None = None,
+        loitering_min_confidence: float = 0.1,
+        loitering_zone_ior_threshold: float = 0.5,
+        loitering_stop_duration_s: float = 0.0,
     ) -> None:
         """Parse topic, translate payload, and dispatch to VMS shim."""
-        import json
-
         # Normalise: strip optional leading slash, split into parts
         parts = topic.lstrip("/").split("/")
         if len(parts) != 3:  # noqa: PLR2004
@@ -150,12 +181,30 @@ class MqttSubscriber:
         # as seen in DLS pipelines with appsink based destination vs gvametapublish based destination
         metadata = data.get("metadata", data)
         objects, timestamp_ms = translate_dls_metadata(metadata, label_type_map, timestamp_offset_ms)
-        if not objects:
-            logger.debug("mqtt_no_objects_in_frame", topic=topic)
-            return
 
         # device_id = camera_id without vendor prefix (e.g. "nx:abc" → "abc")
         device_id = camera_id.split(":", 1)[-1] if ":" in camera_id else camera_id
+
+        if tracker is not None:
+            tracked = extract_tracked_objects(metadata, loitering_min_confidence, loitering_zone_ior_threshold)
+            tracked_snapshot = tracker.update(device_id, tracked, timestamp_ms)
+            await self._push_loitering_bookmarks(
+                shim, vms_name, device_id, tracked_snapshot, loitering_stop_duration_s, timestamp_ms,
+            )
+            await self._maybe_publish_loitering(
+                mqtt_client,
+                vms_name,
+                analytics_app_id,
+                device_id,
+                tracked_snapshot,
+                timestamp_ms,
+                loitering_publish_interval_s,
+                last_loiter_publish if last_loiter_publish is not None else {},
+            )
+
+        if not objects:
+            logger.debug("mqtt_no_objects_in_frame", topic=topic)
+            return
 
         ok = await shim.push_analytics_objects(device_id, objects, timestamp_ms)
         if not ok:
@@ -173,3 +222,79 @@ class MqttSubscriber:
                 objects_count=len(objects),
                 timestamp_ms=timestamp_ms,
             )
+
+    async def _maybe_publish_loitering(
+        self,
+        mqtt_client: Any,
+        vms_name: str,
+        analytics_app_id: str,
+        device_id: str,
+        tracked_snapshot: list[dict[str, Any]],
+        timestamp_ms: int,
+        publish_interval_s: float,
+        last_publish: dict[str, float],
+    ) -> None:
+        """Rate-limited publish of every tracked object's dwell status for one camera.
+
+        Each object in ``objects`` carries a ``status`` ("loitering"/"normal") field so
+        consumers can filter on dwell time without recomputing it.
+        """
+        if mqtt_client is None:
+            return
+        now = time.monotonic()
+        if now - last_publish.get(device_id, 0.0) < publish_interval_s:
+            return
+        last_publish[device_id] = now
+
+        topic = f"{vms_name}/{analytics_app_id}/loiter_status/{device_id}"
+        body = json.dumps({
+            "device_id": device_id,
+            "timestamp_ms": timestamp_ms,
+            "objects": tracked_snapshot,
+        })
+        try:
+            await mqtt_client.publish(topic, body)
+            logger.debug("mqtt_loiter_status_published", device_id=device_id, count=len(tracked_snapshot))
+        except Exception as exc:  # noqa: BLE001 — publish failures shouldn't crash the subscriber loop
+            logger.warning("mqtt_loiter_status_publish_failed", device_id=device_id, error=str(exc))
+
+    async def _push_loitering_bookmarks(
+        self,
+        shim: Any,
+        vms_name: str,
+        device_id: str,
+        tracked_snapshot: list[dict[str, Any]],
+        stop_duration_s: float,
+        timestamp_ms: int,
+    ) -> None:
+        """Create a one-time Nx bookmark for each object that just crossed the loitering threshold.
+
+        Fires once per loitering episode (``just_started_loitering``), not on every update, so
+        the camera timeline gets a single marker per person rather than continuous spam.
+        """
+        if shim is None or not hasattr(shim, "set_bookmark"):
+            return
+        alerts = [e for e in tracked_snapshot if e.get("just_started_loitering")]
+        if not alerts:
+            return
+
+        camera_id_ref = f"{vms_name}:{device_id}"
+        timestamp = datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc)
+        for entry in alerts:
+            label = f"Person {entry['track_id']} found loitering more than {int(stop_duration_s)}s in the zone"
+            try:
+                result = await shim.set_bookmark(camera_id_ref, timestamp, label)
+                logger.info(
+                    "loitering_bookmark_pushed",
+                    device_id=device_id,
+                    track_id=entry["track_id"],
+                    status=getattr(result, "status", None),
+                )
+            except Exception as exc:  # noqa: BLE001 — bookmark failures shouldn't crash the subscriber loop
+                logger.warning(
+                    "loitering_bookmark_failed",
+                    device_id=device_id,
+                    track_id=entry["track_id"],
+                    error=str(exc),
+                )
+

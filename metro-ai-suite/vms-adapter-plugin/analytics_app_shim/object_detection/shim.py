@@ -91,6 +91,10 @@ class ObjectDetectionAnalyticsAppShim(IAnalyticsAppShim):
                 label_type_map=self._config.label_type_map,
                 timestamp_offset_ms=self._config.metadata_timestamp_offset_ms,
                 tls_context=_make_tls_context(self._config),
+                loitering_stop_duration_seconds=self._config.loitering_stop_duration_seconds,
+                loitering_publish_interval_seconds=self._config.loitering_publish_interval_seconds,
+                loitering_min_confidence=self._config.loitering_min_confidence,
+                loitering_zone_ior_threshold=self._config.loitering_zone_ior_threshold,
             ),
             name=f"mqtt-subscriber-{self.app_id}",
         )

@@ -49,6 +49,18 @@ class ObjectDetectionAnalyticsAppConfig(BaseModel):
     # Per-device pipeline mapping used by Nx UI controls and run startup.
     # At least one of CPU/GPU/NPU must be configured with a non-empty value.
     pipeline: dict[str, str] = Field(default_factory=dict)
+    # Seconds a tracked object must stay in frame before it's flagged as loitering.
+    # 0 disables loitering detection/publish entirely.
+    loitering_stop_duration_seconds: float = 5.0
+    # Minimum interval between loiter-status MQTT publishes for the same camera.
+    loitering_publish_interval_seconds: float = 1.0
+    # Detection confidence a tracked object must exceed to count towards dwell time
+    # (matches the standalone Node-RED loitering flow's object_confidence default).
+    loitering_min_confidence: float = 0.1
+    # Min overlap (intersection-over-object-area) with the pipeline's attached gvaattachroi
+    # region for an object to count towards dwell time (matches Node-RED's intersection_threshold
+    # default). The zone itself comes from the payload, not a hardcoded value.
+    loitering_zone_ior_threshold: float = 0.5
 
     @model_validator(mode="after")
     def _normalize_and_validate_pipeline_map(self):

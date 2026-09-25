@@ -40,6 +40,18 @@ analytics_apps:
       gpu: ${DLS_PIPELINE_GPU:-}
       npu: ${DLS_PIPELINE_NPU:-}
 
+    # Loitering: every tracked object is published (rate-limited to
+    # loitering_publish_interval_seconds) to "{vms_name}/{app_id}/loiter_status/{device_id}"
+    # with a status field ("loitering" once dwell >= loitering_stop_duration_seconds, else
+    # "normal") so consumers can filter by dwell time. 0 disables the feature. Matches the
+    # standalone Node-RED loitering flow's own logic: exact gvatrack id match per object,
+    # confidence filtered by loitering_min_confidence, zone taken from the pipeline's own
+    # attached gvaattachroi region (not hardcoded) and filtered by loitering_zone_ior_threshold.
+    loitering_stop_duration_seconds: ${DLS_LOITERING_STOP_DURATION_SECONDS:-5}
+    loitering_publish_interval_seconds: ${DLS_LOITERING_PUBLISH_INTERVAL_SECONDS:-5}
+    loitering_min_confidence: ${DLS_LOITERING_MIN_CONFIDENCE:-0.1}
+    loitering_zone_ior_threshold: ${DLS_LOITERING_ZONE_IOR_THRESHOLD:-0.5}
+
     # Map detection labels (case-insensitive) to Nx Witness object typeIds.
     # Labels not listed here fall back to "python.detected.object".
     # These types are also registered in the Nx manifest automatically at startup.
